@@ -1,0 +1,309 @@
+name: rag-doc-assistant
+
+# ──────────────────────────────────────────────
+# Shared configuration anchors
+# ──────────────────────────────────────────────
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-restart: &default-restart
+  restart: unless-stopped
+
+x-healthcheck-defaults: &healthcheck-defaults
+  interval: 10s
+  timeout: 5s
+  retries: 5
+  start_period: 20s
+
+services:
+
+  # ──────────────────────────────────────────────
+  # FastAPI backend
+  # ──────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+      args:
+        PYTHON_VERSION: "3.11"
+    container_name: rag-api
+    <<: *default-restart
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app:/app/app                   # hot-reload in dev
+      - faiss-index:/app/data/faiss      # persisted vector index
+      - uploads:/app/data/uploads        # uploaded documents
+    environment:
+      # App
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - SECRET_KEY=${SECRET_KEY:?SECRET_KEY is required}
+      # OpenAI
+      - OPENAI_API_KEY=${OPENAI_API_KEY:?OPENAI_API_KEY is required}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-small}
+      # Database
+      - DATABASE_URL=postgresql+asyncpg://rag_user:${POSTGRES_PASSWORD:-rag_pass}@postgres:5432/rag_db
+      - DATABASE_URL_SYNC=postgresql+psycopg2://rag_user:${POSTGRES_PASSWORD:-rag_pass}@postgres:5432/rag_db
+      # Redis
+      - REDIS_URL=redis://redis:6379/0
+      # Vector store
+      - FAISS_INDEX_PATH=/app/data/faiss
+      - VECTOR_STORE_TYPE=${VECTOR_STORE_TYPE:-faiss}
+      # RAG settings
+      - CHUNK_SIZE=${CHUNK_SIZE:-1000}
+      - CHUNK_OVERLAP=${CHUNK_OVERLAP:-200}
+      - RETRIEVAL_TOP_K=${RETRIEVAL_TOP_K:-20}
+      - RERANKER_TOP_K=${RERANKER_TOP_K:-5}
+      - RERANKER_ENABLED=${RERANKER_ENABLED:-true}
+      # Observability
+      - LANGCHAIN_TRACING_V2=${LANGCHAIN_TRACING_V2:-false}
+      - LANGCHAIN_API_KEY=${LANGCHAIN_API_KEY:-}
+      - LANGCHAIN_PROJECT=${LANGCHAIN_PROJECT:-rag-dev}
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      <<: *healthcheck-defaults
+    logging: *default-logging
+    networks:
+      - rag-network
+
+  # ──────────────────────────────────────────────
+  # Streamlit frontend
+  # ──────────────────────────────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      target: runtime
+    container_name: rag-frontend
+    <<: *default-restart
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./frontend:/app/frontend        # hot-reload in dev
+    environment:
+      - API_BASE_URL=http://api:8000
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+      - STREAMLIT_SERVER_HEADLESS=true
+      - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+      - STREAMLIT_THEME_PRIMARY_COLOR=${STREAMLIT_THEME_COLOR:-#7F77DD}
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      <<: *healthcheck-defaults
+    logging: *default-logging
+    networks:
+      - rag-network
+
+  # ──────────────────────────────────────────────
+  # PostgreSQL — documents, conversations, users
+  # ──────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: rag-postgres
+    <<: *default-restart
+    ports:
+      - "5432:5432"                       # expose for local psql / DBeaver
+    environment:
+      - POSTGRES_USER=rag_user
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-rag_pass}
+      - POSTGRES_DB=rag_db
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag_user -d rag_db"]
+      <<: *healthcheck-defaults
+    logging: *default-logging
+    networks:
+      - rag-network
+
+  # ──────────────────────────────────────────────
+  # Redis — job queue, session cache, rate limiting
+  # ──────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: rag-redis
+    <<: *default-restart
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+      --save 60 1
+      --loglevel warning
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --requirepass ${REDIS_PASSWORD:-}
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      <<: *healthcheck-defaults
+    logging: *default-logging
+    networks:
+      - rag-network
+
+  # ──────────────────────────────────────────────
+  # Alembic migration runner (runs once then exits)
+  # ──────────────────────────────────────────────
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: rag-migrate
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      - DATABASE_URL_SYNC=postgresql+psycopg2://rag_user:${POSTGRES_PASSWORD:-rag_pass}@postgres:5432/rag_db
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"                        # run once and exit
+    networks:
+      - rag-network
+
+  # ──────────────────────────────────────────────
+  # MLflow tracking server
+  # ──────────────────────────────────────────────
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.13.0
+    container_name: rag-mlflow
+    <<: *default-restart
+    ports:
+      - "5000:5000"
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri postgresql+psycopg2://rag_user:${POSTGRES_PASSWORD:-rag_pass}@postgres:5432/rag_db
+      --default-artifact-root /mlflow/artifacts
+      --serve-artifacts
+    volumes:
+      - mlflow-artifacts:/mlflow/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    logging: *default-logging
+    networks:
+      - rag-network
+
+  # ──────────────────────────────────────────────
+  # Nginx reverse proxy (production profile only)
+  # ──────────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: rag-nginx
+    <<: *default-restart
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./certs:/etc/nginx/certs:ro        # TLS certs (Let's Encrypt)
+    depends_on:
+      - api
+      - frontend
+    profiles:
+      - production                         # only starts with --profile production
+    logging: *default-logging
+    networks:
+      - rag-network
+
+  # ──────────────────────────────────────────────
+  # Prometheus metrics scraper (observability profile)
+  # ──────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: rag-prometheus
+    <<: *default-restart
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    profiles:
+      - observability
+    logging: *default-logging
+    networks:
+      - rag-network
+
+  # ──────────────────────────────────────────────
+  # Grafana dashboards (observability profile)
+  # ──────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: rag-grafana
+    <<: *default-restart
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    profiles:
+      - observability
+    logging: *default-logging
+    networks:
+      - rag-network
+
+# ──────────────────────────────────────────────
+# Named volumes
+# ──────────────────────────────────────────────
+volumes:
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+  faiss-index:
+    driver: local
+  uploads:
+    driver: local
+  mlflow-artifacts:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+
+# ──────────────────────────────────────────────
+# Networks
+# ──────────────────────────────────────────────
+networks:
+  rag-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
